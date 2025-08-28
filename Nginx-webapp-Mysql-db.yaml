@@ -354,14 +354,17 @@ spec:
 # =========================================================
 # 10️⃣ Ingress Resource
 #    - Routes traffic from domain to Nginx web
-# =========================================================
+# / → main Nginx web app
+# /app1 → App1 service
+# /app2 → App2 service
+=========================================================
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
   name: nginx-stack-ingress
   namespace: nginx-stack
   annotations:
-    nginx.ingress.kubernetes.io/rewrite-target: /
+    nginx.ingress.kubernetes.io/rewrite-target: /   # Rewrites path for backend
     nginx.ingress.kubernetes.io/ssl-redirect: "true"
 spec:
   ingressClassName: nginx
@@ -373,10 +376,29 @@ spec:
     - host: web.yourdomain.com
       http:
         paths:
+          # Main web app
           - path: /
             pathType: Prefix
             backend:
               service:
                 name: nginx-web
+                port:
+                  number: 80
+
+          # App1
+          - path: /app1
+            pathType: Prefix
+            backend:
+              service:
+                name: app1-service
+                port:
+                  number: 80
+
+          # App2
+          - path: /app2
+            pathType: Prefix
+            backend:
+              service:
+                name: app2-service
                 port:
                   number: 80
