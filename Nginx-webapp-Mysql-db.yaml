@@ -1,0 +1,382 @@
+# =========================================================
+# 1️⃣ Namespaces
+#    - nginx-stack: MySQL + Nginx app
+#    - ingress-nginx: Nginx Ingress Controller
+# =========================================================
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: nginx-stack
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ingress-nginx
+
+# =========================================================
+# 2️⃣ Secrets & ConfigMaps
+#    - MySQL credentials
+#    - TLS certificate for Ingress
+#    - MySQL connection info (ConfigMap)
+# =========================================================
+apiVersion: v1
+kind: Secret
+metadata:
+  name: mysql-secret
+  namespace: nginx-stack
+type: Opaque
+data:
+  mysql-root-username: bXlzcWxhZG1pbg==   # base64 of 'mysqladmin'
+  mysql-root-password: c2VjdXJlcGFzcw==   # base64 of 'securepass'
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: nginx-tls-secret
+  namespace: nginx-stack
+type: kubernetes.io/tls
+data:
+  tls.crt:  # base64 encoded TLS certificate
+  tls.key:  # base64 encoded TLS key
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mysql-config
+  namespace: nginx-stack
+data:
+  mysql-url: mysql://mysql-0.mysql-headless.nginx-stack.svc.cluster.local:3306
+
+# =========================================================
+# 3️⃣ StorageClass for MySQL Persistent Storage
+# =========================================================
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: mysql-storage
+provisioner: kubernetes.io/azure-disk
+reclaimPolicy: Retain
+allowVolumeExpansion: true
+parameters:
+  skuName: Premium_LRS
+  kind: managed
+volumeBindingMode: WaitForFirstConsumer
+
+# =========================================================
+# 4️⃣ MySQL StatefulSet
+#    - 3 replicas
+#    - Persistent storage
+#    - Security context for non-root
+#    - Readiness & liveness probes
+# =========================================================
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mysql
+  namespace: nginx-stack
+spec:
+  serviceName: mysql-headless
+  replicas: 3
+  selector:
+    matchLabels:
+      app: mysql
+  template:
+    metadata:
+      labels:
+        app: mysql
+    spec:
+      securityContext:
+        fsGroup: 999
+      containers:
+        - name: mysql
+          image: mysql:8.1
+          ports:
+            - containerPort: 3306
+          env:
+            - name: MYSQL_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: mysql-secret
+                  key: mysql-root-password
+            - name: MYSQL_ROOT_USER
+              valueFrom:
+                secretKeyRef:
+                  name: mysql-secret
+                  key: mysql-root-username
+          volumeMounts:
+            - name: mysql-persistent-storage
+              mountPath: /var/lib/mysql
+          readinessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - "mysqladmin ping -h localhost"
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - "mysqladmin ping -h localhost"
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "500m"
+            limits:
+              memory: "1Gi"
+              cpu: "1000m"
+  volumeClaimTemplates:
+    - metadata:
+        name: mysql-persistent-storage
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: mysql-storage
+        resources:
+          requests:
+            storage: 10Gi
+
+# =========================================================
+# 5️⃣ MySQL Services
+#    - Headless service for StatefulSet communication
+#    - ClusterIP service for app access
+# =========================================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: mysql-headless
+  namespace: nginx-stack
+spec:
+  clusterIP: None
+  selector:
+    app: mysql
+  ports:
+    - port: 3306
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mysql
+  namespace: nginx-stack
+spec:
+  type: ClusterIP
+  selector:
+    app: mysql
+  ports:
+    - port: 3306
+
+# =========================================================
+# 6️⃣ NetworkPolicy
+#    - Allow Nginx web pods to access MySQL
+# =========================================================
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-nginx-to-mysql
+  namespace: nginx-stack
+spec:
+  podSelector:
+    matchLabels:
+      app: mysql
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: nginx-web
+      ports:
+        - protocol: TCP
+          port: 3306
+  policyTypes:
+    - Ingress
+
+# =========================================================
+# 7️⃣ MySQL Init Job
+#    - Create database/schema on first startup
+# =========================================================
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: init-mysql
+  namespace: nginx-stack
+spec:
+  template:
+    spec:
+      containers:
+        - name: mysql-init
+          image: mysql:8.1
+          env:
+            - name: MYSQL_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: mysql-secret
+                  key: mysql-root-password
+          command:
+            - sh
+            - -c
+            - |
+              mysql -h mysql-0.mysql-headless.nginx-stack.svc.cluster.local -u mysqladmin -p$MYSQL_ROOT_PASSWORD -e "CREATE DATABASE IF NOT EXISTS appdb;"
+      restartPolicy: OnFailure
+
+# =========================================================
+# 8️⃣ Nginx Deployment & Service
+#    - Waits for MySQL readiness
+#    - Probes & resources configured
+# =========================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nginx-web
+  namespace: nginx-stack
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: nginx-web
+  template:
+    metadata:
+      labels:
+        app: nginx-web
+    spec:
+      initContainers:
+        - name: wait-for-mysql
+          image: busybox
+          command:
+            - sh
+            - -c
+            - >
+              until nc -z mysql 3306;
+              do
+                echo "Waiting for MySQL to be ready...";
+                sleep 2;
+              done
+      containers:
+        - name: nginx
+          image: nginx:latest
+          ports:
+            - containerPort: 80
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 80
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 80
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "250m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nginx-web
+  namespace: nginx-stack
+spec:
+  selector:
+    app: nginx-web
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 80
+  type: ClusterIP
+
+# =========================================================
+# 9️⃣ Nginx Ingress Controller Deployment & LoadBalancer Service
+# =========================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ingress-nginx-controller
+  namespace: ingress-nginx
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ingress-nginx
+      app.kubernetes.io/component: controller
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ingress-nginx
+        app.kubernetes.io/component: controller
+    spec:
+      containers:
+        - name: controller
+          image: k8s.gcr.io/ingress-nginx/controller:v1.10.0
+          args:
+            - /nginx-ingress-controller
+            - --configmap=$(POD_NAMESPACE)/ingress-nginx-controller
+            - --watch-namespace=$(POD_NAMESPACE)
+          env:
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          ports:
+            - name: http
+              containerPort: 80
+            - name: https
+              containerPort: 443
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ingress-nginx-controller
+  namespace: ingress-nginx
+spec:
+  type: LoadBalancer
+  loadBalancerIP: <STATIC_IP>   # Replace with your Azure static IP
+  selector:
+    app.kubernetes.io/component: controller
+  ports:
+    - name: http
+      port: 80
+      targetPort: 80
+    - name: https
+      port: 443
+      targetPort: 443
+
+# =========================================================
+# 10️⃣ Ingress Resource
+#    - Routes traffic from domain to Nginx web
+# =========================================================
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: nginx-stack-ingress
+  namespace: nginx-stack
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - web.yourdomain.com
+      secretName: nginx-tls-secret
+  rules:
+    - host: web.yourdomain.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: nginx-web
+                port:
+                  number: 80
