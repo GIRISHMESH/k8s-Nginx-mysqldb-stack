@@ -1,7 +1,5 @@
 # =========================================================
 # 1️⃣ Namespaces
-#    - nginx-stack: MySQL + Nginx app
-#    - ingress-nginx: Nginx Ingress Controller
 # =========================================================
 apiVersion: v1
 kind: Namespace
@@ -15,9 +13,6 @@ metadata:
 
 # =========================================================
 # 2️⃣ Secrets & ConfigMaps
-#    - MySQL credentials
-#    - TLS certificate for Ingress
-#    - MySQL connection info (ConfigMap)
 # =========================================================
 apiVersion: v1
 kind: Secret
@@ -26,7 +21,6 @@ metadata:
   namespace: nginx-stack
 type: Opaque
 data:
-  mysql-root-username: bXlzcWxhZG1pbg==   # base64 of 'mysqladmin'
   mysql-root-password: c2VjdXJlcGFzcw==   # base64 of 'securepass'
 ---
 apiVersion: v1
@@ -36,8 +30,8 @@ metadata:
   namespace: nginx-stack
 type: kubernetes.io/tls
 data:
-  tls.crt:  # base64 encoded TLS certificate
-  tls.key:  # base64 encoded TLS key
+  tls.crt: <BASE64_CERT>
+  tls.key: <BASE64_KEY>
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -48,7 +42,7 @@ data:
   mysql-url: mysql://mysql-0.mysql-headless.nginx-stack.svc.cluster.local:3306
 
 # =========================================================
-# 3️⃣ StorageClass for MySQL Persistent Storage
+# 3️⃣ StorageClass
 # =========================================================
 apiVersion: storage.k8s.io/v1
 kind: StorageClass
@@ -64,10 +58,6 @@ volumeBindingMode: WaitForFirstConsumer
 
 # =========================================================
 # 4️⃣ MySQL StatefulSet
-#    - 3 replicas
-#    - Persistent storage
-#    - Security context for non-root
-#    - Readiness & liveness probes
 # =========================================================
 apiVersion: apps/v1
 kind: StatefulSet
@@ -98,32 +88,19 @@ spec:
                 secretKeyRef:
                   name: mysql-secret
                   key: mysql-root-password
-            - name: MYSQL_ROOT_USER
-              valueFrom:
-                secretKeyRef:
-                  name: mysql-secret
-                  key: mysql-root-username
           volumeMounts:
             - name: mysql-persistent-storage
               mountPath: /var/lib/mysql
           readinessProbe:
             exec:
-              command:
-                - sh
-                - -c
-                - "mysqladmin ping -h localhost"
+              command: ["mysqladmin", "ping", "-h", "localhost"]
             initialDelaySeconds: 10
             periodSeconds: 10
-            timeoutSeconds: 5
           livenessProbe:
             exec:
-              command:
-                - sh
-                - -c
-                - "mysqladmin ping -h localhost"
+              command: ["mysqladmin", "ping", "-h", "localhost"]
             initialDelaySeconds: 30
             periodSeconds: 10
-            timeoutSeconds: 5
           resources:
             requests:
               memory: "512Mi"
@@ -143,8 +120,6 @@ spec:
 
 # =========================================================
 # 5️⃣ MySQL Services
-#    - Headless service for StatefulSet communication
-#    - ClusterIP service for app access
 # =========================================================
 apiVersion: v1
 kind: Service
@@ -172,7 +147,6 @@ spec:
 
 # =========================================================
 # 6️⃣ NetworkPolicy
-#    - Allow Nginx web pods to access MySQL
 # =========================================================
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -196,7 +170,6 @@ spec:
 
 # =========================================================
 # 7️⃣ MySQL Init Job
-#    - Create database/schema on first startup
 # =========================================================
 apiVersion: batch/v1
 kind: Job
@@ -218,14 +191,14 @@ spec:
           command:
             - sh
             - -c
-            - |
-              mysql -h mysql-0.mysql-headless.nginx-stack.svc.cluster.local -u mysqladmin -p$MYSQL_ROOT_PASSWORD -e "CREATE DATABASE IF NOT EXISTS appdb;"
+            - >
+              mysql -h mysql-0.mysql-headless.nginx-stack.svc.cluster.local
+              -u root -p$MYSQL_ROOT_PASSWORD
+              -e "CREATE DATABASE IF NOT EXISTS appdb;"
       restartPolicy: OnFailure
 
 # =========================================================
 # 8️⃣ Nginx Deployment & Service
-#    - Waits for MySQL readiness
-#    - Probes & resources configured
 # =========================================================
 apiVersion: apps/v1
 kind: Deployment
@@ -249,9 +222,8 @@ spec:
             - sh
             - -c
             - >
-              until nc -z mysql 3306;
-              do
-                echo "Waiting for MySQL to be ready...";
+              until nc -z mysql 3306; do
+                echo "Waiting for MySQL...";
                 sleep 2;
               done
       containers:
@@ -264,15 +236,11 @@ spec:
               path: /
               port: 80
             initialDelaySeconds: 5
-            periodSeconds: 10
-            timeoutSeconds: 3
           livenessProbe:
             httpGet:
               path: /
               port: 80
             initialDelaySeconds: 30
-            periodSeconds: 10
-            timeoutSeconds: 5
           resources:
             requests:
               memory: "256Mi"
@@ -290,13 +258,12 @@ spec:
   selector:
     app: nginx-web
   ports:
-    - protocol: TCP
-      port: 80
+    - port: 80
       targetPort: 80
   type: ClusterIP
 
 # =========================================================
-# 9️⃣ Nginx Ingress Controller Deployment & LoadBalancer Service
+# 9️⃣ Ingress Controller
 # =========================================================
 apiVersion: apps/v1
 kind: Deployment
@@ -319,9 +286,9 @@ spec:
         - name: controller
           image: k8s.gcr.io/ingress-nginx/controller:v1.10.0
           args:
-            - /nginx-ingress-controller
-            - --configmap=$(POD_NAMESPACE)/ingress-nginx-controller
-            - --watch-namespace=$(POD_NAMESPACE)
+            - --controller-class=k8s.io/ingress-nginx
+            - --publish-service=$(POD_NAMESPACE)/ingress-nginx-controller
+            - --election-id=ingress-controller-leader
           env:
             - name: POD_NAMESPACE
               valueFrom:
@@ -340,7 +307,7 @@ metadata:
   namespace: ingress-nginx
 spec:
   type: LoadBalancer
-  loadBalancerIP: <STATIC_IP>   # Replace with your Azure static IP
+  loadBalancerIP: <STATIC_IP>
   selector:
     app.kubernetes.io/component: controller
   ports:
@@ -350,21 +317,24 @@ spec:
     - name: https
       port: 443
       targetPort: 443
+---
+apiVersion: networking.k8s.io/v1
+kind: IngressClass
+metadata:
+  name: nginx
+spec:
+  controller: k8s.io/ingress-nginx
 
 # =========================================================
-# 10️⃣ Ingress Resource
-#    - Routes traffic from domain to Nginx web
-# / → main Nginx web app
-# /app1 → App1 service
-# /app2 → App2 service
-=========================================================
+# 🔟 Ingress Resource
+# =========================================================
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
   name: nginx-stack-ingress
   namespace: nginx-stack
   annotations:
-    nginx.ingress.kubernetes.io/rewrite-target: /   # Rewrites path for backend
+    nginx.ingress.kubernetes.io/rewrite-target: /
     nginx.ingress.kubernetes.io/ssl-redirect: "true"
 spec:
   ingressClassName: nginx
@@ -376,7 +346,6 @@ spec:
     - host: web.yourdomain.com
       http:
         paths:
-          # Main web app
           - path: /
             pathType: Prefix
             backend:
@@ -385,48 +354,31 @@ spec:
                 port:
                   number: 80
 
-          # App1
-          - path: /app1
-            pathType: Prefix
-            backend:
-              service:
-                name: app1-service
-                port:
-                  number: 80
-
-          # App2
-          - path: /app2
-            pathType: Prefix
-            backend:
-              service:
-                name: app2-service
-                port:
-                  number: 80
-
-
-
+# =========================================================
+# 1️⃣1️⃣ ExternalDNS with Workload Identity (OIDC)
+# =========================================================
 apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: external-dns
   namespace: nginx-stack
   annotations:
-    azure.workload.identity/client-id: <UAMI_CLIENT_ID>   # Replace with your User Assigned Managed Identity client ID
-
+    azure.workload.identity/client-id: <UAMI_CLIENT_ID>
+---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
   name: external-dns
 rules:
   - apiGroups: [""]
-    resources: ["services", "endpoints", "pods"]
+    resources: ["services", "endpoints", "pods", "nodes"]
     verbs: ["get", "watch", "list"]
   - apiGroups: ["networking.k8s.io"]
     resources: ["ingresses"]
     verbs: ["get", "watch", "list"]
   - apiGroups: [""]
-    resources: ["nodes"]
-    verbs: ["list", "watch"]
+    resources: ["events"]
+    verbs: ["create", "patch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -440,8 +392,7 @@ subjects:
   - kind: ServiceAccount
     name: external-dns
     namespace: nginx-stack
-
-
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -464,11 +415,15 @@ spec:
           args:
             - --source=service
             - --source=ingress
-            - --domain-filter=yourdomain.com        # Change to your DNS zone
+            - --domain-filter=yourdomain.com
             - --provider=azure
-            - --azure-resource-group=<DNS_RG_NAME>  # RG containing your DNS Zone
+            - --azure-resource-group=<DNS_RG_NAME>
             - --azure-subscription-id=<SUBSCRIPTION_ID>
-            - --azure-tenant-id=<TENANT_ID>
             - --log-level=debug
-
-
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi
